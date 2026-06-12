@@ -1,0 +1,6 @@
+{
+  "name": "Gemini and Claude Dual Chat Client",
+  "description": "Multi-model chat workspace featuring seamless Google Gemini and Anthropic Claude integration, user authentication, PDF file text extraction, historical session saving, and an administrative dashboard, powered by a local SQLite database.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
