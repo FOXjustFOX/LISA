@@ -2,6 +2,7 @@ import sqlite3 from "sqlite3";
 import path from "path";
 import crypto from "crypto";
 import fs from "fs";
+import { logger } from "./logger";
 
 // Initialize the database connection
 const dbPath = path.resolve(process.cwd(), "local.db");
@@ -54,7 +55,7 @@ export function run(sql: string, params: any[] = []): Promise<{ lastID: number; 
 
 // Database schema setup
 export async function initDatabase() {
-  console.log("Initializing database at:", dbPath);
+  logger.info(`Initializing database at: ${dbPath}`);
 
   // 1. Create Users Table
   await run(`
@@ -94,12 +95,24 @@ export async function initDatabase() {
     )
   `);
 
-  // 4. Seed admin from env vars
+  // 4. Create Settings Table
+  await run(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+
+  // Seed default model settings
+  await run("INSERT OR IGNORE INTO settings (key, value) VALUES ('gemini_model', 'gemini-2.0-flash')");
+  await run("INSERT OR IGNORE INTO settings (key, value) VALUES ('claude_model', 'claude-3-5-sonnet-latest')");
+
+  // 5. Seed admin from env vars
   const adminEmail = process.env.ADMIN_EMAIL;
   const adminPassword = process.env.ADMIN_PASSWORD;
 
   if (!adminEmail || !adminPassword) {
-    console.error("ERROR: ADMIN_EMAIL and ADMIN_PASSWORD env vars not set — skipping admin seed.");
+    logger.error("ADMIN_EMAIL and ADMIN_PASSWORD env vars not set — skipping admin seed.");
   } else {
     const existingAdmin = await queryOne<{ id: number }>(
       "SELECT id FROM users WHERE email = ?",
@@ -111,7 +124,9 @@ export async function initDatabase() {
         "INSERT INTO users (email, password_hash, role, status) VALUES (?, ?, ?, ?)",
         [adminEmail, hash, "admin", "active"]
       );
-      console.log("Seeded admin user:", adminEmail);
+      logger.info(`Admin user seeded: ${adminEmail}`);
+    } else {
+      logger.debug(`Admin user already exists: ${adminEmail}`);
     }
   }
 }

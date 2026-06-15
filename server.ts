@@ -3,7 +3,6 @@ import path from "path";
 import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
-import * as pdfParse from "pdf-parse";
 import dotenv from "dotenv";
 
 import {
@@ -14,11 +13,12 @@ import {
   hashPassword,
   verifyPassword,
 } from "./server/db";
+import { logger } from "./server/logger";
 
 dotenv.config();
 
 if (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD) {
-  console.error("ERROR: ADMIN_EMAIL and ADMIN_PASSWORD must be set in environment variables.");
+  logger.error("ADMIN_EMAIL and ADMIN_PASSWORD must be set in environment variables.");
   process.exit(1);
 }
 
@@ -31,6 +31,16 @@ const TOKEN_SECRET = process.env.TOKEN_SECRET || "gemini_claude_dual_secret_stri
 // Increase body payload limits to easily handle base64 PDF attachments
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const ms = Date.now() - start;
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    logger[level](`${req.method} ${req.path} ${res.statusCode} ${ms}ms`);
+  });
+  next();
+});
 
 // Token generation helper
 function generateToken(userId: number, role: string): string {
@@ -65,12 +75,14 @@ function verifyToken(token: string): { userId: number; role: string } | null {
 async function requireAuth(req: any, res: any, next: any) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    logger.warn(`Auth failed: missing token [${req.method} ${req.path}]`);
     return res.status(401).json({ error: "Unauthorized. Missing token." });
   }
 
   const token = authHeader.split(" ")[1];
   const decoded = verifyToken(token);
   if (!decoded) {
+    logger.warn(`Auth failed: invalid or expired token [${req.method} ${req.path}]`);
     return res.status(401).json({ error: "Unauthorized. Invalid or expired token." });
   }
 
@@ -81,6 +93,7 @@ async function requireAuth(req: any, res: any, next: any) {
   );
 
   if (!user || user.status === "suspended") {
+    logger.warn(`Auth blocked: suspended/deleted user id=${decoded.userId}`);
     return res.status(403).json({ error: "Account suspended or deleted." });
   }
 
@@ -95,6 +108,7 @@ async function requireAuth(req: any, res: any, next: any) {
 async function requireAdmin(req: any, res: any, next: any) {
   await requireAuth(req, res, () => {
     if (req.user.role !== "admin") {
+      logger.warn(`Admin access denied: ${req.user.email} [${req.method} ${req.path}]`);
       return res.status(403).json({ error: "Admin resource. Access denied." });
     }
     next();
@@ -124,18 +138,22 @@ app.post("/api/auth/login", async (req, res) => {
     );
 
     if (!user) {
+      logger.warn(`Login failed (not found): ${email}`);
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
     if (user.status === "suspended") {
+      logger.warn(`Login blocked (suspended): ${email}`);
       return res.status(403).json({ error: "This account has been suspended by an administrator." });
     }
 
     const matches = verifyPassword(password, user.password_hash);
     if (!matches) {
+      logger.warn(`Login failed (wrong password): ${email}`);
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
+    logger.info(`Login success: ${email} [role=${user.role}]`);
     const token = generateToken(user.id, user.role);
     res.json({
       token,
@@ -351,6 +369,37 @@ app.get("/api/admin/stats", requireAdmin, async (req, res) => {
 });
 
 // ------------------------------------------
+// SETTINGS ENDPOINTS
+// ------------------------------------------
+
+app.get("/api/admin/settings", requireAdmin, async (req, res) => {
+  try {
+    const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings");
+    const settings = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+    res.json(settings);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/admin/settings", requireAdmin, async (req: any, res) => {
+  const { gemini_model, claude_model } = req.body;
+  try {
+    if (gemini_model) {
+      await run("INSERT OR REPLACE INTO settings (key, value) VALUES ('gemini_model', ?)", [gemini_model]);
+      logger.info(`Setting updated: gemini_model=${gemini_model} by ${req.user.email}`);
+    }
+    if (claude_model) {
+      await run("INSERT OR REPLACE INTO settings (key, value) VALUES ('claude_model', ?)", [claude_model]);
+      logger.info(`Setting updated: claude_model=${claude_model} by ${req.user.email}`);
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------
 // CHATS & MESSAGES ENDPOINTS
 // ------------------------------------------
 
@@ -381,6 +430,7 @@ app.post("/api/chats", requireAuth, async (req: any, res) => {
       [chatId, req.user.id, title, provider]
     );
 
+    logger.info(`Chat created: "${title}" [${provider}] by user ${req.user.email}`);
     res.json({ id: chatId, title, provider });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -402,6 +452,7 @@ app.delete("/api/chats/:id", requireAuth, async (req: any, res) => {
 
     await run("DELETE FROM chats WHERE id = ?", [chatId]);
     await run("DELETE FROM messages WHERE chat_id = ?", [chatId]);
+    logger.info(`Chat deleted: ${chatId} by user ${req.user.email}`);
     res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -455,163 +506,127 @@ app.post("/api/chats/:id/messages", requireAuth, async (req: any, res) => {
       return res.status(403).json({ error: "Access denied." });
     }
 
-    let fileText = "";
-    let savedFileName: string | null = null;
-    let savedFileType: string | null = null;
+    const savedFileName: string | null = file ? (file.name || "attachment.pdf") : null;
+    const savedFileType: string = file ? (file.type || "application/pdf") : "application/pdf";
 
-    // 1. Process PDF Attachment (if sent)
-    if (file && file.base64) {
-      savedFileName = file.name || "attachment.pdf";
-      savedFileType = file.type || "application/pdf";
+    // 1. Store user message — text only, PDF sent natively to model (not extracted)
+    const humanDbContent = savedFileName
+      ? `[PDF: "${savedFileName}"]\n\n${content || "Please analyze this document."}`
+      : (content || "");
 
-      try {
-        const fileBuffer = Buffer.from(file.base64, "base64");
-        // Only run pdf-parse if the attachment is actually pdf
-        if (savedFileType.includes("pdf") || savedFileName.endsWith(".pdf")) {
-          const parsedPdf = await ((pdfParse as any).default || (pdfParse as any))(fileBuffer);
-          fileText = parsedPdf.text;
-          console.log(`Successfully parsed PDF "${savedFileName}": Extracted ${fileText.length} characters of raw text context.`);
-        } else {
-          // If other textual files are uploaded, parse them simply as utf-8
-          fileText = fileBuffer.toString("utf-8");
-        }
-      } catch (parseErr: any) {
-        console.error("PDF Parsing Error:", parseErr);
-        fileText = `[Parsing failed for file ${savedFileName}: ${parseErr.message}]`;
-      }
-    }
-
-    // 2. Persist the human user's message in SQLite Database
-    let humanFullContent = content || "";
-    if (savedFileName && fileText) {
-      humanFullContent = `[Attached PDF Document: "${savedFileName}"]\n\n--- DOCUMENT CONTENT START ---\n${fileText.slice(0, 150000)}\n--- DOCUMENT CONTENT END ---\n\nUser request:\n${content || "Please analyze this uploaded document."}`;
-    }
+    if (savedFileName) logger.debug(`Native PDF attached: "${savedFileName}" (${savedFileType})`);
 
     await run(
       "INSERT INTO messages (chat_id, sender, content, file_name, file_type) VALUES (?, ?, ?, ?, ?)",
-      [chatId, "user", humanFullContent, savedFileName, savedFileType]
+      [chatId, "user", humanDbContent, savedFileName, savedFileName ? savedFileType : null]
     );
 
-    // 3. Fetch past session messages to feed context (up to nearest 20 messages for tokens health)
+    // 2. Fetch history (includes current message just inserted)
     const history = await query<{ sender: string; content: string }>(
       "SELECT sender, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT 20",
       [chatId]
     );
-    // Reverse historical listing back to ascending chronological order
     const chatMessages = history.reverse();
 
-    // 4. Run AI Agent logic based on the session provider choice
+    // 3. Run AI
     let assistantReply = "";
 
     if (chat.provider === "gemini") {
-      // Setup Gemini Custom/Env credentials
       const geminiApiKey = customGeminiKey || process.env.GEMINI_API_KEY;
       if (!geminiApiKey || geminiApiKey === "MY_GEMINI_API_KEY") {
-        return res.status(400).json({
-          error: "Gemini API key is not configured. Please supply your API key in the configuration header or the server secrets.",
-        });
+        return res.status(400).json({ error: "Gemini API key not configured." });
       }
 
-      const client = new GoogleGenAI({
-        apiKey: geminiApiKey,
-        httpOptions: {
-          headers: {
-            "User-Agent": "aistudio-build",
-          },
-        },
+      const client = new GoogleGenAI({ apiKey: geminiApiKey, httpOptions: { headers: { "User-Agent": "aistudio-build" } } });
+
+      const geminiContents = chatMessages.map((msg, idx) => {
+        const isCurrentWithFile = idx === chatMessages.length - 1 && file?.base64;
+        if (isCurrentWithFile) {
+          const parts: any[] = [
+            { inlineData: { mimeType: savedFileType, data: file.base64 } },
+            { text: content || "Please analyze this document." },
+          ];
+          return { role: "user", parts };
+        }
+        return { role: msg.sender === "user" ? "user" : "model", parts: [{ text: msg.content }] };
       });
 
-      // Format past messages according to Gemini contents parameters
-      // We can map history to the correct role naming format
-      const geminiContents = chatMessages.map((msg) => ({
-        role: msg.sender === "user" ? "user" : "model",
-        parts: [{ text: msg.content }],
-      }));
+      const modelRow = await queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'gemini_model'");
+      const modelName = modelRow?.value || "gemini-2.0-flash";
+      logger.debug(`Calling Gemini [${modelName}] for chat ${chatId}`);
 
-      const modelName = "gemini-3.5-flash"; // Valid and recommended modern model selection
       const response = await client.models.generateContent({
         model: modelName,
         contents: geminiContents,
-        config: {
-          systemInstruction: "You are a professional, helpful assistant with deep analyzer features. You can digest whole PDF texts and provide insights with direct quotes and structured formatting, keeping answers readable, fast, and simple.",
-        },
+        config: { systemInstruction: "You are a helpful assistant. When given a PDF, analyze it thoroughly and answer with clear, structured responses." },
       });
 
-      assistantReply = response.text || "Gemini completed without writing any response.";
+      assistantReply = response.text || "Gemini returned no response.";
+      logger.info(`Gemini reply: ${assistantReply.length} chars for chat ${chatId}`);
 
     } else if (chat.provider === "claude") {
-      // Setup Claude Custom/Env credentials
       const claudeApiKey = customClaudeKey || process.env.ANTHROPIC_API_KEY;
       if (!claudeApiKey || claudeApiKey === "MY_ANTHROPIC_API_KEY") {
-        return res.status(400).json({
-          error: "Claude API key is not configured. Please supply your Anthropic API key in the configuration header or the server secrets.",
-        });
+        return res.status(400).json({ error: "Claude API key not configured." });
       }
 
-      // Reformat historical context into Claude API's standard user/assistant schema
-      const claudeMessages = chatMessages.map((msg) => ({
-        role: msg.sender === "user" ? "user" : "assistant",
-        content: msg.content,
-      }));
+      const claudeMessages = chatMessages.map((msg, idx) => {
+        const isCurrentWithFile = idx === chatMessages.length - 1 && file?.base64;
+        if (isCurrentWithFile) {
+          const blocks: any[] = [
+            { type: "document", source: { type: "base64", media_type: savedFileType, data: file.base64 } },
+            { type: "text", text: content || "Please analyze this document." },
+          ];
+          return { role: "user", content: blocks };
+        }
+        return { role: msg.sender === "user" ? "user" : "assistant", content: msg.content };
+      });
 
-      // Direct Anthropic Messages Endpoint fetch call
+      const claudeModel = (await queryOne<{ value: string }>("SELECT value FROM settings WHERE key = 'claude_model'"))?.value || "claude-3-5-sonnet-latest";
+      logger.debug(`Calling Claude [${claudeModel}] for chat ${chatId}`);
+
       const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
           "x-api-key": claudeApiKey,
           "anthropic-version": "2023-06-01",
+          "anthropic-beta": "pdfs-2024-09-25",
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          model: "claude-3-5-sonnet-latest",
+          model: claudeModel,
           max_tokens: 4000,
-          system: "You are a professional assistant with deep textual digestion features. You analyze uploaded PDF contents with extreme clarity.",
+          system: "You are a helpful assistant. When given a PDF, analyze it thoroughly and answer with clear, structured responses.",
           messages: claudeMessages,
         }),
       });
 
       if (!anthropicResponse.ok) {
         const errorText = await anthropicResponse.text();
-        console.error("Anthropic Claude Error Response:", errorText);
-        throw new Error(`Claude API request failed: ${errorText || anthropicResponse.statusText}`);
+        logger.error(`Claude API error ${anthropicResponse.status}`, errorText);
+        throw new Error(`Claude API error: ${anthropicResponse.status}`);
       }
 
       const claudeData = await anthropicResponse.json();
-      if (claudeData.content && Array.isArray(claudeData.content)) {
-        assistantReply = claudeData.content
-          .filter((block: any) => block.type === "text")
-          .map((block: any) => block.text)
-          .join("\n");
-      } else {
-        assistantReply = "Claude responded with empty content blocks.";
-      }
+      assistantReply = Array.isArray(claudeData.content)
+        ? claudeData.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n")
+        : "Claude returned no response.";
+      logger.info(`Claude reply: ${assistantReply.length} chars for chat ${chatId}`);
+
     } else {
-      throw new Error(`Unsupported model provider: "${chat.provider}"`);
+      throw new Error(`Unsupported provider: "${chat.provider}"`);
     }
 
-    // 5. Save assistant response into database
-    await run(
-      "INSERT INTO messages (chat_id, sender, content) VALUES (?, 'assistant', ?)",
-      [chatId, assistantReply]
-    );
+    // 4. Save assistant response
+    await run("INSERT INTO messages (chat_id, sender, content) VALUES (?, 'assistant', ?)", [chatId, assistantReply]);
 
     res.json({
-      userMessage: {
-        chat_id: chatId,
-        sender: "user",
-        content: humanFullContent,
-        file_name: savedFileName,
-        file_type: savedFileType,
-      },
-      assistantMessage: {
-        chat_id: chatId,
-        sender: "assistant",
-        content: assistantReply,
-      },
+      userMessage: { chat_id: chatId, sender: "user", content: humanDbContent, file_name: savedFileName, file_type: savedFileName ? savedFileType : null },
+      assistantMessage: { chat_id: chatId, sender: "assistant", content: assistantReply },
     });
 
   } catch (err: any) {
-    console.error("Chat Message Execution Error:", err);
+    logger.error("Message handler error", { message: err.message, stack: err.stack });
     res.status(500).json({ error: err.message || "An internal error occurred during chat reasoning." });
   }
 });
@@ -665,10 +680,11 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Dual Chat Workspace] running at http://0.0.0.0:${PORT}`);
+    logger.info(`Server running at http://0.0.0.0:${PORT} [LOG_LEVEL=${process.env.LOG_LEVEL ?? "info"}]`);
   });
 }
 
 startServer().catch((err) => {
-  console.error("Critical server startup failure:", err);
+  logger.error(`Critical server startup failure: ${err.message}`);
+  process.exit(1);
 });

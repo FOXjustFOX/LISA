@@ -24,6 +24,11 @@ export interface Message {
   created_at: string;
 }
 
+export interface AdminSettings {
+  gemini_model: string;
+  claude_model: string;
+}
+
 export interface AdminStats {
   totalUsers: number;
   totalChats: number;
