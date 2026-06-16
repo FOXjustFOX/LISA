@@ -27,10 +27,16 @@ import {
     UserX,
     Lock,
     ChevronDown,
+    Download,
+    Archive,
+    StickyNote,
+    Upload,
+    Eye,
+    EyeOff,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { MarkdownRenderer } from "./components/MarkdownRenderer";
-import { User, Chat, Message, AdminStats, AdminSettings } from "./types";
+import { User, Chat, Message, AdminStats, AdminSettings, ShelfItem } from "./types";
 
 export default function App() {
     // Authentication states
@@ -98,15 +104,34 @@ export default function App() {
     // Admin User Creation Form
     const [isAdminCreateOpen, setIsAdminCreateOpen] = useState(false);
     const [adminNewEmail, setAdminNewEmail] = useState("");
+    const [adminNewUsername, setAdminNewUsername] = useState("");
     const [adminNewPassword, setAdminNewPassword] = useState("");
     const [adminNewRole, setAdminNewRole] = useState<"admin" | "user">("user");
+    const [editingUserId, setEditingUserId] = useState<number | null>(null);
+    const [editUserEmail, setEditUserEmail] = useState("");
+    const [editUserUsername, setEditUserUsername] = useState("");
+    const [editUserPassword, setEditUserPassword] = useState("");
 
     // Mobile drawer controls
     const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
+    // Shelf states
+    const [isShelfOpen, setIsShelfOpen] = useState(false);
+    const [shelfItems, setShelfItems] = useState<ShelfItem[]>([]);
+    const [shelfLoading, setShelfLoading] = useState(false);
+    const [isAddingNote, setIsAddingNote] = useState(false);
+    const [shelfNoteTitle, setShelfNoteTitle] = useState("");
+    const [shelfNoteText, setShelfNoteText] = useState("");
+    const [expandedNoteId, setExpandedNoteId] = useState<number | null>(null);
+    const [expandedNoteContent, setExpandedNoteContent] = useState<string | null>(null);
+    const [editingNoteTitle, setEditingNoteTitle] = useState("");
+    const [editingNoteContent, setEditingNoteContent] = useState("");
+    const [noteEditMode, setNoteEditMode] = useState(false);
+
     // Scrolling reference
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const shelfFileInputRef = useRef<HTMLInputElement>(null);
 
     // Persistent user profiles check
     useEffect(() => {
@@ -229,9 +254,20 @@ export default function App() {
             });
             if (res.ok) {
                 const data = await res.json();
-                setChats(data);
-                if (data.length > 0 && !selectedChatId) {
-                    setSelectedChatId(data[0].id);
+                if (data.length === 0) {
+                    const created = await fetch("/api/chats", {
+                        method: "POST",
+                        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+                        body: JSON.stringify({ title: "New Chat", provider: "gemini" }),
+                    });
+                    if (created.ok) {
+                        const newChat = await created.json();
+                        setChats([newChat]);
+                        setSelectedChatId(newChat.id);
+                    }
+                } else {
+                    setChats(data);
+                    if (!selectedChatId) setSelectedChatId(data[0].id);
                 }
             }
         } catch {
@@ -705,6 +741,39 @@ export default function App() {
         }
     };
 
+    const handleAdminEditUserSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!editUserEmail.trim()) return;
+        try {
+            const res = await fetch(`/api/admin/users/${editingUserId}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({
+                    email: editUserEmail.trim(),
+                    username: editUserUsername.trim() || undefined,
+                    password: editUserPassword || undefined,
+                }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                setAdminUsers((prev) =>
+                    prev.map((u) =>
+                        u.id === editingUserId
+                            ? { ...u, email: editUserEmail.trim(), username: editUserUsername.trim() || null }
+                            : u,
+                    ),
+                );
+                setEditingUserId(null);
+                setEditUserPassword("");
+                showToast("User updated.");
+            } else {
+                triggerError(data.error || "Failed to update user.");
+            }
+        } catch {
+            triggerError("Network error updating user.");
+        }
+    };
+
     const handleAdminCreateUserSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
         if (!adminNewEmail.trim() || !adminNewPassword) {
@@ -723,6 +792,7 @@ export default function App() {
                 },
                 body: JSON.stringify({
                     email: adminNewEmail.trim(),
+                    username: adminNewUsername.trim() || undefined,
                     password: adminNewPassword,
                     role: adminNewRole,
                 }),
@@ -731,6 +801,7 @@ export default function App() {
             const data = await res.json();
             if (res.ok) {
                 setAdminNewEmail("");
+                setAdminNewUsername("");
                 setAdminNewPassword("");
                 setAdminNewRole("user");
                 setIsAdminCreateOpen(false);
@@ -747,6 +818,183 @@ export default function App() {
     };
 
     // ------------------------------------------
+    // SHELF HANDLERS
+    // ------------------------------------------
+
+    const loadShelf = async () => {
+        setShelfLoading(true);
+        try {
+            const res = await fetch("/api/shelf", {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (res.ok) setShelfItems(await res.json());
+        } catch {
+            triggerError("Could not load shelf items.");
+        } finally {
+            setShelfLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        if (isShelfOpen) loadShelf();
+    }, [isShelfOpen]);
+
+    const handleShelfFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        if (file.size > 15 * 1024 * 1024) {
+            triggerError("Max file size is 15 MB.");
+            return;
+        }
+        const reader = new FileReader();
+        reader.onload = async () => {
+            const base64 = (reader.result as string).split(",")[1];
+            try {
+                const res = await fetch("/api/shelf", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ name: file.name, item_type: file.type || "application/octet-stream", data: base64, size: file.size }),
+                });
+                if (res.ok) {
+                    const item = await res.json();
+                    setShelfItems((prev) => [item, ...prev]);
+                    showToast(`"${file.name}" added to shelf.`);
+                } else {
+                    const d = await res.json();
+                    triggerError(d.error || "Failed to upload to shelf.");
+                }
+            } catch {
+                triggerError("Network error uploading to shelf.");
+            }
+        };
+        reader.readAsDataURL(file);
+        e.target.value = "";
+    };
+
+    const handleShelfNoteCreate = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!shelfNoteTitle.trim() || !shelfNoteText.trim()) return;
+        try {
+            const res = await fetch("/api/shelf", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ name: shelfNoteTitle.trim(), item_type: "note", data: shelfNoteText.trim(), size: shelfNoteText.length }),
+            });
+            if (res.ok) {
+                const item = await res.json();
+                setShelfItems((prev) => [item, ...prev]);
+                setShelfNoteTitle("");
+                setShelfNoteText("");
+                setIsAddingNote(false);
+                showToast("Note saved to shelf.");
+            } else {
+                const d = await res.json();
+                triggerError(d.error || "Failed to save note.");
+            }
+        } catch {
+            triggerError("Network error saving note.");
+        }
+    };
+
+    const handleShelfDownload = async (item: ShelfItem) => {
+        try {
+            const res = await fetch(`/api/shelf/${item.id}/download`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) { triggerError("Download failed."); return; }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = item.item_type === "note" ? `${item.name}.txt` : item.name;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch {
+            triggerError("Network error downloading file.");
+        }
+    };
+
+    const handleShelfDelete = async (itemId: number) => {
+        if (!confirm("Delete this shelf item?")) return;
+        try {
+            const res = await fetch(`/api/shelf/${itemId}`, {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (res.ok) {
+                setShelfItems((prev) => prev.filter((i) => i.id !== itemId));
+                showToast("Item removed from shelf.");
+            } else {
+                triggerError("Failed to delete shelf item.");
+            }
+        } catch {
+            triggerError("Network error deleting shelf item.");
+        }
+    };
+
+    const handleViewNote = async (item: ShelfItem) => {
+        if (expandedNoteId === item.id) {
+            setExpandedNoteId(null);
+            setExpandedNoteContent(null);
+            return;
+        }
+        try {
+            const res = await fetch(`/api/shelf/${item.id}/download`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) { triggerError("Could not load note."); return; }
+            const text = await res.text();
+            setExpandedNoteId(item.id);
+            setExpandedNoteContent(text);
+            setEditingNoteTitle(item.name);
+            setEditingNoteContent(text);
+            setNoteEditMode(false);
+        } catch {
+            triggerError("Network error loading note.");
+        }
+    };
+
+    const handleSaveNote = async (itemId: number) => {
+        try {
+            const res = await fetch(`/api/shelf/${itemId}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ name: editingNoteTitle, data: editingNoteContent }),
+            });
+            if (res.ok) {
+                setShelfItems((prev) =>
+                    prev.map((i) => i.id === itemId ? { ...i, name: editingNoteTitle, size: editingNoteContent.length } : i)
+                );
+                setExpandedNoteContent(editingNoteContent);
+                showToast("Note saved.");
+            } else {
+                const d = await res.json();
+                triggerError(d.error || "Failed to save note.");
+            }
+        } catch {
+            triggerError("Network error saving note.");
+        }
+    };
+
+    const handleDownloadMessageFile = async (messageId: number, fileName: string) => {
+        try {
+            const res = await fetch(`/api/messages/${messageId}/file`, {
+                headers: { Authorization: `Bearer ${token}` },
+            });
+            if (!res.ok) { triggerError("File not available for download."); return; }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch {
+            triggerError("Network error downloading file.");
+        }
+    };
+
+    // ------------------------------------------
     // ACTIVE CHAT REFERENCE
     // ------------------------------------------
     const activeChat = chats.find((c) => c.id === selectedChatId);
@@ -759,7 +1007,7 @@ export default function App() {
     if (!token) {
         return (
             <div className="min-h-screen bg-slate-50 flex flex-col justify-center py-12 sm:px-6 lg:px-8 font-sans transition-all duration-300">
-                <div className="absolute top-4 right-4 max-w-sm z-50">
+                <div className="absolute bottom-4 right-4 max-w-sm z-50">
                     <AnimatePresence>
                         {authError && (
                             <motion.div
@@ -794,17 +1042,17 @@ export default function App() {
                         <form onSubmit={handleLogin} className="space-y-4">
                             <div>
                                 <label className="block text-xs font-bold text-slate-600 uppercase tracking-wider mb-1">
-                                    Email Address
+                                    Username or Email
                                 </label>
                                 <input
-                                    type="email"
+                                    type="text"
                                     required
                                     autoComplete="off"
                                     value={loginEmail}
                                     onChange={(e) =>
                                         setLoginEmail(e.target.value)
                                     }
-                                    placeholder="you@example.com"
+                                    placeholder="username or email"
                                     className="w-full rounded-xl border border-slate-250 px-4 py-2.5 text-sm text-slate-800 placeholder-slate-400 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-100 focus:border-indigo-500 transition-all"
                                 />
                             </div>
@@ -865,11 +1113,11 @@ export default function App() {
     return (
         <div className="h-screen bg-slate-50 flex overflow-hidden font-sans text-slate-900 transition-all duration-300 select-none">
             {/* Alert & Success Toasts */}
-            <div className="absolute top-4 right-4 max-w-sm z-50 pointer-events-none space-y-2">
+            <div className="fixed bottom-4 right-4 max-w-sm z-[9999] pointer-events-none space-y-2">
                 <AnimatePresence>
                     {globalError && (
                         <motion.div
-                            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+                            initial={{ opacity: 0, y: 20, scale: 0.95 }}
                             animate={{ opacity: 1, y: 0, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.95 }}
                             className="rounded-xl p-4 bg-white border border-rose-250 shadow-lg text-rose-800 text-xs md:text-sm flex items-start gap-3 pointer-events-auto">
@@ -887,7 +1135,7 @@ export default function App() {
 
                     {successToast && (
                         <motion.div
-                            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+                            initial={{ opacity: 0, y: 20, scale: 0.95 }}
                             animate={{ opacity: 1, y: 0, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.95 }}
                             className="rounded-xl p-4 bg-white border border-emerald-250 shadow-lg text-emerald-800 text-xs md:text-sm flex items-start gap-3 pointer-events-auto">
@@ -1058,6 +1306,14 @@ export default function App() {
 
                 {/* Workspace Action Bottom Rails */}
                 <div className="p-4 border-t border-slate-150 space-y-1 bg-slate-50">
+                    <button
+                        type="button"
+                        onClick={() => setIsShelfOpen(true)}
+                        className="w-full text-left font-bold text-xs text-slate-600 hover:text-slate-850 p-2.5 rounded-xl hover:bg-slate-150/50 transition-all cursor-pointer flex items-center gap-2">
+                        <Archive className="w-4 h-4 text-teal-500" />
+                        <span>My Shelf</span>
+                    </button>
+
                     <button
                         type="button"
                         onClick={() => setIsKeysModalOpen(true)}
@@ -1246,6 +1502,16 @@ export default function App() {
                                     <button
                                         type="button"
                                         onClick={() => {
+                                            setIsShelfOpen(true);
+                                            setIsMobileSidebarOpen(false);
+                                        }}
+                                        className="w-full text-left font-bold text-xs text-slate-600 hover:text-slate-800 p-2.5 rounded-xl hover:bg-slate-150/50 flex items-center gap-2">
+                                        <Archive className="w-4 h-4 text-teal-500" />
+                                        <span>My Shelf</span>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
                                             setIsKeysModalOpen(true);
                                             setIsMobileSidebarOpen(false);
                                         }}
@@ -1333,7 +1599,7 @@ export default function App() {
                                             <div
                                                 className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 shadow-xs border ${
                                                     isAssistant
-                                                        ? "bg-slate-50 text-slate-900 border-slate-150 rounded-tl-sm"
+                                                        ? "bg-slate-50 text-slate-900 border-slate-150 rounded-tl-sm select-text"
                                                         : "bg-indigo-600 text-white border-indigo-700 rounded-tr-sm"
                                                 }`}>
                                                 {m.file_name && (
@@ -1344,12 +1610,19 @@ export default function App() {
                                                                 : "bg-indigo-700/50 text-white border border-indigo-500/50"
                                                         }`}>
                                                         <FileText className="w-4 h-4 shrink-0 text-amber-500" />
-                                                        <span className="truncate font-semibold max-w-[150px]">
+                                                        <span className="truncate font-semibold max-w-[110px]">
                                                             {m.file_name}
                                                         </span>
                                                         <span className="text-[9px] uppercase font-black tracking-wider shrink-0 bg-slate-900/10 px-1 py-0.5 rounded">
                                                             Analyzed
                                                         </span>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleDownloadMessageFile(m.id, m.file_name!)}
+                                                            className="ml-auto shrink-0 p-1 rounded hover:bg-black/10 transition-colors"
+                                                            title="Download file">
+                                                            <Download className="w-3 h-3" />
+                                                        </button>
                                                     </div>
                                                 )}
                                                 {isAssistant ? (
@@ -1630,7 +1903,7 @@ export default function App() {
                                     <div
                                         className={`max-w-[75%] rounded-2xl px-5 py-4 shadow-xs border ${
                                             isAssistant
-                                                ? "bg-white text-slate-850 border-slate-200 rounded-tl-sm font-normal"
+                                                ? "bg-white text-slate-850 border-slate-200 rounded-tl-sm font-normal select-text"
                                                 : "bg-indigo-600 text-white border-indigo-700 rounded-tr-sm font-medium"
                                         }`}>
                                         {m.file_name && (
@@ -1641,12 +1914,19 @@ export default function App() {
                                                         : "bg-indigo-700/50 text-white border border-indigo-500/50"
                                                 }`}>
                                                 <FileText className="w-4 h-4 text-amber-500 shrink-0" />
-                                                <span className="truncate font-semibold max-w-[200px]">
+                                                <span className="truncate font-semibold max-w-[160px]">
                                                     {m.file_name}
                                                 </span>
                                                 <span className="text-[9px] uppercase font-black tracking-wider bg-slate-900/15 text-slate-800 px-1.5 py-0.5 rounded">
                                                     Parsed Document context
                                                 </span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleDownloadMessageFile(m.id, m.file_name!)}
+                                                    className="ml-auto shrink-0 p-1 rounded hover:bg-black/10 transition-colors"
+                                                    title="Download file">
+                                                    <Download className="w-3.5 h-3.5" />
+                                                </button>
                                             </div>
                                         )}
                                         {isAssistant ? (
@@ -2026,6 +2306,221 @@ export default function App() {
                 )}
             </AnimatePresence>
 
+            {/* SHELF MODAL */}
+            <AnimatePresence>
+                {isShelfOpen && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 backdrop-blur-xs p-4">
+                        <motion.div
+                            initial={{ scale: 0.97, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.97, opacity: 0 }}
+                            className="bg-white rounded-2xl max-w-2xl w-full max-h-[88vh] overflow-hidden border border-slate-200 shadow-xl flex flex-col">
+                            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+                                <div className="flex items-center gap-2">
+                                    <Archive className="w-4 h-4 text-teal-500" />
+                                    <span className="font-bold text-sm text-slate-900">My Shelf</span>
+                                    <span className="text-[10px] uppercase font-black text-slate-400 tracking-wider ml-1">Cross-device file storage</span>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => { setIsShelfOpen(false); setIsAddingNote(false); }}
+                                    className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-700">
+                                    <X className="w-4 h-4" />
+                                </button>
+                            </div>
+
+                            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+                                {/* Actions */}
+                                <div className="flex gap-2">
+                                    <input
+                                        type="file"
+                                        ref={shelfFileInputRef}
+                                        onChange={handleShelfFileSelect}
+                                        className="hidden"
+                                    />
+                                    <button
+                                        type="button"
+                                        onClick={() => shelfFileInputRef.current?.click()}
+                                        className="flex items-center gap-1.5 px-3 py-2 bg-teal-600 text-white rounded-lg text-xs font-semibold hover:bg-teal-700 cursor-pointer transition-all">
+                                        <Upload className="w-3.5 h-3.5" />
+                                        Upload File
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsAddingNote((v) => !v)}
+                                        className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold cursor-pointer transition-all border ${isAddingNote ? "bg-slate-100 border-slate-300 text-slate-700" : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"}`}>
+                                        <StickyNote className="w-3.5 h-3.5" />
+                                        {isAddingNote ? "Cancel Note" : "Add Note"}
+                                    </button>
+                                </div>
+
+                                {/* Note form */}
+                                <AnimatePresence>
+                                    {isAddingNote && (
+                                        <motion.form
+                                            initial={{ height: 0, opacity: 0 }}
+                                            animate={{ height: "auto", opacity: 1 }}
+                                            exit={{ height: 0, opacity: 0 }}
+                                            onSubmit={handleShelfNoteCreate}
+                                            className="overflow-hidden border border-slate-200 rounded-xl p-4 space-y-3 bg-slate-50">
+                                            <input
+                                                type="text"
+                                                required
+                                                value={shelfNoteTitle}
+                                                onChange={(e) => setShelfNoteTitle(e.target.value)}
+                                                placeholder="Note title..."
+                                                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-teal-100 focus:border-teal-400"
+                                            />
+                                            <textarea
+                                                required
+                                                value={shelfNoteText}
+                                                onChange={(e) => setShelfNoteText(e.target.value)}
+                                                placeholder="Write your note..."
+                                                rows={4}
+                                                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-teal-100 focus:border-teal-400 resize-none"
+                                            />
+                                            <div className="flex justify-end">
+                                                <button
+                                                    type="submit"
+                                                    className="px-4 py-2 bg-slate-900 text-white rounded-lg text-xs font-semibold hover:bg-slate-700 cursor-pointer">
+                                                    Save Note
+                                                </button>
+                                            </div>
+                                        </motion.form>
+                                    )}
+                                </AnimatePresence>
+
+                                {/* Items list */}
+                                {shelfLoading ? (
+                                    <div className="text-center py-8 text-sm text-slate-400">Loading shelf…</div>
+                                ) : shelfItems.length === 0 ? (
+                                    <div className="text-center py-12 flex flex-col items-center gap-2">
+                                        <Archive className="w-8 h-8 text-slate-200" />
+                                        <p className="text-sm font-semibold text-slate-400">Shelf is empty</p>
+                                        <p className="text-xs text-slate-400">Upload files or notes — access them from any device.</p>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-2">
+                                        {shelfItems.map((item) => (
+                                            <div key={item.id} className="rounded-xl border border-slate-100 overflow-hidden">
+                                                <div className="flex items-center gap-3 p-3 bg-slate-50 hover:bg-white transition-all">
+                                                    <div className={`p-2 rounded-lg shrink-0 ${item.item_type === "note" ? "bg-amber-50 border border-amber-200" : "bg-teal-50 border border-teal-200"}`}>
+                                                        {item.item_type === "note"
+                                                            ? <StickyNote className="w-4 h-4 text-amber-500" />
+                                                            : <FileText className="w-4 h-4 text-teal-500" />}
+                                                    </div>
+                                                    <div className="flex-1 min-w-0">
+                                                        <p className="text-sm font-semibold text-slate-800 truncate">{item.name}</p>
+                                                        <p className="text-[10px] text-slate-400 uppercase tracking-wider font-bold mt-0.5">
+                                                            {item.item_type === "note" ? "Note" : item.item_type.split("/").pop()?.toUpperCase() ?? "File"}
+                                                            {item.size ? ` • ${(item.size / 1024).toFixed(0)} KB` : ""}
+                                                            {" • "}{new Date(item.created_at).toLocaleDateString()}
+                                                        </p>
+                                                    </div>
+                                                    <div className="flex items-center gap-1 shrink-0">
+                                                        {item.item_type === "note" && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleViewNote(item)}
+                                                                className="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-amber-50 transition-all cursor-pointer"
+                                                                title={expandedNoteId === item.id ? "Collapse" : "Read note"}>
+                                                                {expandedNoteId === item.id
+                                                                    ? <EyeOff className="w-4 h-4" />
+                                                                    : <Eye className="w-4 h-4" />}
+                                                            </button>
+                                                        )}
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleShelfDownload(item)}
+                                                            className="p-1.5 rounded-lg text-slate-400 hover:text-teal-600 hover:bg-teal-50 transition-all cursor-pointer"
+                                                            title="Download">
+                                                            <Download className="w-4 h-4" />
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleShelfDelete(item.id)}
+                                                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-all cursor-pointer"
+                                                            title="Delete">
+                                                            <Trash2 className="w-4 h-4" />
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <AnimatePresence>
+                                                    {expandedNoteId === item.id && expandedNoteContent !== null && (
+                                                        <motion.div
+                                                            initial={{ height: 0, opacity: 0 }}
+                                                            animate={{ height: "auto", opacity: 1 }}
+                                                            exit={{ height: 0, opacity: 0 }}
+                                                            className="overflow-hidden border-t border-amber-100">
+                                                            <div className="bg-amber-50/40 p-4 flex flex-col gap-3">
+                                                                {/* Title row */}
+                                                                <div className="flex items-center gap-2">
+                                                                    {noteEditMode ? (
+                                                                        <input
+                                                                            type="text"
+                                                                            value={editingNoteTitle}
+                                                                            onChange={(e) => setEditingNoteTitle(e.target.value)}
+                                                                            className="flex-1 text-base font-bold text-slate-800 bg-transparent border-b border-amber-200 focus:border-amber-400 focus:outline-none pb-1 placeholder-slate-300"
+                                                                            placeholder="Note title…"
+                                                                        />
+                                                                    ) : (
+                                                                        <span className="flex-1 text-base font-bold text-slate-800 pb-1 border-b border-amber-100">
+                                                                            {editingNoteTitle}
+                                                                        </span>
+                                                                    )}
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => setNoteEditMode((v) => !v)}
+                                                                        className="text-[10px] uppercase font-black tracking-wider px-2 py-1 rounded-lg border border-amber-200 text-amber-700 bg-amber-50 hover:bg-amber-100 transition-all cursor-pointer shrink-0">
+                                                                        {noteEditMode ? "Preview" : "Edit"}
+                                                                    </button>
+                                                                </div>
+
+                                                                {/* Body */}
+                                                                {noteEditMode ? (
+                                                                    <textarea
+                                                                        value={editingNoteContent}
+                                                                        onChange={(e) => setEditingNoteContent(e.target.value)}
+                                                                        rows={10}
+                                                                        className="w-full text-sm text-slate-700 bg-white/70 border border-amber-100 rounded-lg p-3 resize-none focus:outline-none focus:ring-2 focus:ring-amber-200 leading-relaxed font-mono placeholder-slate-300 select-text"
+                                                                        placeholder="Write markdown…"
+                                                                    />
+                                                                ) : (
+                                                                    <div className="min-h-[80px] text-sm text-slate-700 leading-relaxed select-text">
+                                                                        <MarkdownRenderer text={editingNoteContent} />
+                                                                    </div>
+                                                                )}
+
+                                                                {/* Footer */}
+                                                                <div className="flex justify-between items-center border-t border-amber-100 pt-2">
+                                                                    <span className="text-[10px] text-slate-400 font-medium">
+                                                                        {editingNoteContent.length} chars
+                                                                    </span>
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => handleSaveNote(item.id)}
+                                                                        disabled={
+                                                                            editingNoteContent === expandedNoteContent &&
+                                                                            editingNoteTitle === item.name
+                                                                        }
+                                                                        className="px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-semibold hover:bg-slate-700 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer transition-all">
+                                                                        Save
+                                                                    </button>
+                                                                </div>
+                                                            </div>
+                                                        </motion.div>
+                                                    )}
+                                                </AnimatePresence>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
+
             {/* ADMIN PANEL */}
             <AnimatePresence>
                 {isAdminOpen && (
@@ -2222,7 +2717,7 @@ export default function App() {
                                                     onSubmit={
                                                         handleAdminCreateUserSubmit
                                                     }
-                                                    className="p-4 grid grid-cols-3 gap-3 items-end bg-slate-50/60">
+                                                    className="p-4 grid grid-cols-4 gap-3 items-end bg-slate-50/60">
                                                     <div>
                                                         <label className="block text-xs text-slate-500 font-medium mb-1">
                                                             Email
@@ -2240,6 +2735,20 @@ export default function App() {
                                                                 )
                                                             }
                                                             placeholder="user@example.com"
+                                                            className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                                                        />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-xs text-slate-500 font-medium mb-1">
+                                                            Username
+                                                        </label>
+                                                        <input
+                                                            type="text"
+                                                            value={adminNewUsername}
+                                                            onChange={(e) =>
+                                                                setAdminNewUsername(e.target.value)
+                                                            }
+                                                            placeholder="optional"
                                                             className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-100"
                                                         />
                                                     </div>
@@ -2284,7 +2793,7 @@ export default function App() {
                                                             </option>
                                                         </select>
                                                     </div>
-                                                    <div className="col-span-3 flex justify-end">
+                                                    <div className="col-span-4 flex justify-end">
                                                         <button
                                                             type="submit"
                                                             className="px-4 py-2 bg-slate-900 text-white rounded-lg text-xs font-semibold hover:bg-slate-700 cursor-pointer">
@@ -2336,8 +2845,8 @@ export default function App() {
                                                         const isSelf =
                                                             u.id === user.id;
                                                         return (
+                                                            <React.Fragment key={u.id}>
                                                             <tr
-                                                                key={u.id}
                                                                 className="hover:bg-slate-50">
                                                                 <td className="px-4 py-3 text-slate-800 font-medium">
                                                                     {u.email}
@@ -2380,22 +2889,74 @@ export default function App() {
                                                                         }
                                                                     </button>
                                                                 </td>
-                                                                <td className="px-4 py-3 text-right">
+                                                                <td className="px-4 py-3 text-right flex justify-end gap-1">
                                                                     <button
                                                                         type="button"
-                                                                        disabled={
-                                                                            isSelf
-                                                                        }
-                                                                        onClick={() =>
-                                                                            handleAdminDeleteUser(
-                                                                                u.id,
-                                                                            )
-                                                                        }
+                                                                        onClick={() => {
+                                                                            if (editingUserId === u.id) {
+                                                                                setEditingUserId(null);
+                                                                            } else {
+                                                                                setEditingUserId(u.id);
+                                                                                setEditUserEmail(u.email);
+                                                                                setEditUserUsername(u.username || "");
+                                                                                setEditUserPassword("");
+                                                                            }
+                                                                        }}
+                                                                        className="p-1.5 rounded-lg transition-all text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 cursor-pointer">
+                                                                        <Edit2 className="w-4 h-4" />
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        disabled={isSelf}
+                                                                        onClick={() => handleAdminDeleteUser(u.id)}
                                                                         className={`p-1.5 rounded-lg transition-all ${isSelf ? "text-slate-200 cursor-not-allowed" : "text-slate-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"}`}>
                                                                         <Trash2 className="w-4 h-4" />
                                                                     </button>
                                                                 </td>
                                                             </tr>
+                                                            {editingUserId === u.id && (
+                                                                <tr className="bg-indigo-50/40">
+                                                                    <td colSpan={4} className="px-4 py-3">
+                                                                        <form onSubmit={handleAdminEditUserSubmit} className="grid grid-cols-4 gap-3 items-end">
+                                                                            <div>
+                                                                                <label className="block text-xs text-slate-500 font-medium mb-1">Email</label>
+                                                                                <input
+                                                                                    type="email"
+                                                                                    required
+                                                                                    value={editUserEmail}
+                                                                                    onChange={(e) => setEditUserEmail(e.target.value)}
+                                                                                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                                                                                />
+                                                                            </div>
+                                                                            <div>
+                                                                                <label className="block text-xs text-slate-500 font-medium mb-1">Username</label>
+                                                                                <input
+                                                                                    type="text"
+                                                                                    value={editUserUsername}
+                                                                                    onChange={(e) => setEditUserUsername(e.target.value)}
+                                                                                    placeholder="optional"
+                                                                                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                                                                                />
+                                                                            </div>
+                                                                            <div>
+                                                                                <label className="block text-xs text-slate-500 font-medium mb-1">New Password</label>
+                                                                                <input
+                                                                                    type="password"
+                                                                                    value={editUserPassword}
+                                                                                    onChange={(e) => setEditUserPassword(e.target.value)}
+                                                                                    placeholder="leave blank to keep"
+                                                                                    className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-100"
+                                                                                />
+                                                                            </div>
+                                                                            <div className="flex gap-2">
+                                                                                <button type="submit" className="flex-1 px-3 py-2 bg-slate-900 text-white rounded-lg text-xs font-semibold hover:bg-slate-700 cursor-pointer">Save</button>
+                                                                                <button type="button" onClick={() => setEditingUserId(null)} className="px-3 py-2 border border-slate-200 text-slate-600 rounded-lg text-xs font-semibold hover:bg-slate-50 cursor-pointer">Cancel</button>
+                                                                            </div>
+                                                                        </form>
+                                                                    </td>
+                                                                </tr>
+                                                            )}
+                                                            </React.Fragment>
                                                         );
                                                     })
                                                 )}

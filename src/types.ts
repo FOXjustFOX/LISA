@@ -1,6 +1,7 @@
 export interface User {
   id: number;
   email: string;
+  username?: string | null;
   role: "admin" | "user";
   status: "active" | "suspended";
   created_at?: string;
@@ -35,4 +36,13 @@ export interface AdminStats {
   totalMessages: number;
   providers: { provider: string; count: number }[];
   statusBreakdown: { status: string; count: number }[];
+}
+
+export interface ShelfItem {
+  id: number;
+  user_id: number;
+  name: string;
+  item_type: string;
+  size: number | null;
+  created_at: string;
 }

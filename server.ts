@@ -128,38 +128,40 @@ app.get("/api/auth/me", requireAuth, (req: any, res) => {
 app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
-    return res.status(400).json({ error: "Email and password are required." });
+    return res.status(400).json({ error: "Username/email and password are required." });
   }
 
+  const identifier = email.trim().toLowerCase();
+
   try {
-    const user = await queryOne<{ id: number; password_hash: string; role: string; status: string }>(
-      "SELECT id, password_hash, role, status FROM users WHERE email = ?",
-      [email.trim().toLowerCase()]
+    const user = await queryOne<{ id: number; password_hash: string; role: string; status: string; email: string }>(
+      "SELECT id, password_hash, role, status, email FROM users WHERE email = ? OR username = ?",
+      [identifier, identifier]
     );
 
     if (!user) {
-      logger.warn(`Login failed (not found): ${email}`);
-      return res.status(401).json({ error: "Invalid email or password." });
+      logger.warn(`Login failed (not found): ${identifier}`);
+      return res.status(401).json({ error: "Invalid username or password." });
     }
 
     if (user.status === "suspended") {
-      logger.warn(`Login blocked (suspended): ${email}`);
+      logger.warn(`Login blocked (suspended): ${identifier}`);
       return res.status(403).json({ error: "This account has been suspended by an administrator." });
     }
 
     const matches = verifyPassword(password, user.password_hash);
     if (!matches) {
-      logger.warn(`Login failed (wrong password): ${email}`);
-      return res.status(401).json({ error: "Invalid email or password." });
+      logger.warn(`Login failed (wrong password): ${identifier}`);
+      return res.status(401).json({ error: "Invalid username or password." });
     }
 
-    logger.info(`Login success: ${email} [role=${user.role}]`);
+    logger.info(`Login success: ${identifier} [role=${user.role}]`);
     const token = generateToken(user.id, user.role);
     res.json({
       token,
       user: {
         id: user.id,
-        email: email.trim().toLowerCase(),
+        email: user.email,
         role: user.role,
       },
     });
@@ -220,7 +222,7 @@ app.post("/api/auth/register", async (req, res) => {
 app.get("/api/admin/users", requireAdmin, async (req, res) => {
   try {
     const users = await query(
-      "SELECT id, email, role, status, created_at FROM users ORDER BY created_at DESC"
+      "SELECT id, email, username, role, status, created_at FROM users ORDER BY created_at DESC"
     );
     res.json(users);
   } catch (err: any) {
@@ -228,9 +230,51 @@ app.get("/api/admin/users", requireAdmin, async (req, res) => {
   }
 });
 
+// Update user (email, username, password)
+app.put("/api/admin/users/:id", requireAdmin, async (req: any, res) => {
+  const targetId = parseInt(req.params.id, 10);
+  const { email, username, password } = req.body;
+
+  if (!email) return res.status(400).json({ error: "Email is required." });
+
+  try {
+    const existing = await queryOne<{ id: number }>(
+      "SELECT id FROM users WHERE email = ? AND id != ?",
+      [email.trim().toLowerCase(), targetId]
+    );
+    if (existing) return res.status(400).json({ error: "Email already taken." });
+
+    if (username) {
+      const existingUsername = await queryOne<{ id: number }>(
+        "SELECT id FROM users WHERE username = ? AND id != ?",
+        [username.trim().toLowerCase(), targetId]
+      );
+      if (existingUsername) return res.status(400).json({ error: "Username already taken." });
+    }
+
+    if (password) {
+      const hash = hashPassword(password);
+      await run(
+        "UPDATE users SET email = ?, username = ?, password_hash = ? WHERE id = ?",
+        [email.trim().toLowerCase(), username ? username.trim().toLowerCase() : null, hash, targetId]
+      );
+    } else {
+      await run(
+        "UPDATE users SET email = ?, username = ? WHERE id = ?",
+        [email.trim().toLowerCase(), username ? username.trim().toLowerCase() : null, targetId]
+      );
+    }
+
+    logger.info(`User ${targetId} updated by admin ${req.user.email}`);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Create user directly from Administrator Dashboard
 app.post("/api/admin/users", requireAdmin, async (req, res) => {
-  const { email, password, role } = req.body;
+  const { email, username, password, role } = req.body;
   if (!email || !password || !role) {
     return res.status(400).json({ error: "Email, password, and role are required." });
   }
@@ -243,10 +287,19 @@ app.post("/api/admin/users", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "Email is already taken." });
     }
 
+    if (username) {
+      const existingUsername = await queryOne("SELECT id FROM users WHERE username = ?", [
+        username.trim().toLowerCase(),
+      ]);
+      if (existingUsername) {
+        return res.status(400).json({ error: "Username is already taken." });
+      }
+    }
+
     const hash = hashPassword(password);
     await run(
-      "INSERT INTO users (email, password_hash, role, status) VALUES (?, ?, ?, 'active')",
-      [email.trim().toLowerCase(), hash, role]
+      "INSERT INTO users (email, username, password_hash, role, status) VALUES (?, ?, ?, ?, 'active')",
+      [email.trim().toLowerCase(), username ? username.trim().toLowerCase() : null, hash, role]
     );
 
     res.json({ success: true });
@@ -473,7 +526,7 @@ app.get("/api/chats/:id/messages", requireAuth, async (req: any, res) => {
     }
 
     const messages = await query(
-      "SELECT * FROM messages WHERE chat_id = ? ORDER BY id ASC",
+      "SELECT id, chat_id, sender, content, file_name, file_type, created_at FROM messages WHERE chat_id = ? ORDER BY id ASC",
       [chatId]
     );
     res.json(messages);
@@ -517,8 +570,8 @@ app.post("/api/chats/:id/messages", requireAuth, async (req: any, res) => {
     if (savedFileName) logger.debug(`Native PDF attached: "${savedFileName}" (${savedFileType})`);
 
     await run(
-      "INSERT INTO messages (chat_id, sender, content, file_name, file_type) VALUES (?, ?, ?, ?, ?)",
-      [chatId, "user", humanDbContent, savedFileName, savedFileName ? savedFileType : null]
+      "INSERT INTO messages (chat_id, sender, content, file_name, file_type, file_data) VALUES (?, ?, ?, ?, ?, ?)",
+      [chatId, "user", humanDbContent, savedFileName, savedFileName ? savedFileType : null, file?.base64 || null]
     );
 
     // 2. Fetch history (includes current message just inserted)
@@ -650,6 +703,129 @@ app.post("/api/chats/:id/rename", requireAuth, async (req: any, res) => {
 
     await run("UPDATE chats SET title = ? WHERE id = ?", [title, chatId]);
     res.json({ success: true, title });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Download a file attached to a specific message
+app.get("/api/messages/:id/file", requireAuth, async (req: any, res) => {
+  const messageId = parseInt(req.params.id, 10);
+  try {
+    const message = await queryOne<{ chat_id: string; file_name: string; file_type: string; file_data: string }>(
+      "SELECT chat_id, file_name, file_type, file_data FROM messages WHERE id = ?",
+      [messageId]
+    );
+    if (!message || !message.file_data) {
+      return res.status(404).json({ error: "File not found." });
+    }
+    const chat = await queryOne<{ user_id: number }>("SELECT user_id FROM chats WHERE id = ?", [message.chat_id]);
+    if (!chat || (chat.user_id !== req.user.id && req.user.role !== "admin")) {
+      return res.status(403).json({ error: "Access denied." });
+    }
+    const buffer = Buffer.from(message.file_data, "base64");
+    res.setHeader("Content-Type", message.file_type || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename="${message.file_name}"`);
+    res.send(buffer);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ------------------------------------------
+// SHELF ENDPOINTS
+// ------------------------------------------
+
+app.get("/api/shelf", requireAuth, async (req: any, res) => {
+  try {
+    const items = await query(
+      "SELECT id, user_id, name, item_type, size, created_at FROM shelf_items WHERE user_id = ? ORDER BY created_at DESC",
+      [req.user.id]
+    );
+    res.json(items);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/shelf", requireAuth, async (req: any, res) => {
+  const { name, item_type, data, size } = req.body;
+  if (!name || !item_type || !data) {
+    return res.status(400).json({ error: "Name, type, and data are required." });
+  }
+  try {
+    const result = await run(
+      "INSERT INTO shelf_items (user_id, name, item_type, data, size) VALUES (?, ?, ?, ?, ?)",
+      [req.user.id, name, item_type, data, size || null]
+    );
+    logger.info(`Shelf item added: "${name}" [${item_type}] by ${req.user.email}`);
+    res.json({ id: result.lastID, name, item_type, size: size || null, created_at: new Date().toISOString() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/shelf/:id/download", requireAuth, async (req: any, res) => {
+  const itemId = parseInt(req.params.id, 10);
+  try {
+    const item = await queryOne<{ user_id: number; name: string; item_type: string; data: string }>(
+      "SELECT user_id, name, item_type, data FROM shelf_items WHERE id = ?",
+      [itemId]
+    );
+    if (!item) return res.status(404).json({ error: "Item not found." });
+    if (item.user_id !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied." });
+    }
+    if (item.item_type === "note") {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${item.name}.txt"`);
+      res.send(item.data);
+    } else {
+      const buffer = Buffer.from(item.data, "base64");
+      res.setHeader("Content-Type", item.item_type || "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename="${item.name}"`);
+      res.send(buffer);
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/shelf/:id", requireAuth, async (req: any, res) => {
+  const itemId = parseInt(req.params.id, 10);
+  const { name, data } = req.body;
+  if (!name || !data) {
+    return res.status(400).json({ error: "Name and data are required." });
+  }
+  try {
+    const item = await queryOne<{ user_id: number; item_type: string }>(
+      "SELECT user_id, item_type FROM shelf_items WHERE id = ?",
+      [itemId]
+    );
+    if (!item) return res.status(404).json({ error: "Item not found." });
+    if (item.user_id !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied." });
+    }
+    await run(
+      "UPDATE shelf_items SET name = ?, data = ?, size = ? WHERE id = ?",
+      [name, data, data.length, itemId]
+    );
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/shelf/:id", requireAuth, async (req: any, res) => {
+  const itemId = parseInt(req.params.id, 10);
+  try {
+    const item = await queryOne<{ user_id: number }>("SELECT user_id FROM shelf_items WHERE id = ?", [itemId]);
+    if (!item) return res.status(404).json({ error: "Item not found." });
+    if (item.user_id !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Access denied." });
+    }
+    await run("DELETE FROM shelf_items WHERE id = ?", [itemId]);
+    res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

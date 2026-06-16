@@ -1,7 +1,6 @@
 import sqlite3 from "sqlite3";
 import path from "path";
 import crypto from "crypto";
-import fs from "fs";
 import { logger } from "./logger";
 
 // Initialize the database connection
@@ -62,12 +61,17 @@ export async function initDatabase() {
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT UNIQUE NOT NULL,
+      username TEXT,
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'user',
       status TEXT NOT NULL DEFAULT 'active',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  // Add username column if not exists (migration for existing DBs)
+  await run(`ALTER TABLE users ADD COLUMN username TEXT`).catch(() => {});
+  await run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)`);
 
   // 2. Create Chats Table
   await run(`
@@ -90,12 +94,29 @@ export async function initDatabase() {
       content TEXT NOT NULL,
       file_name TEXT,
       file_type TEXT,
+      file_data TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
     )
   `);
+  // Migration: add file_data to existing databases
+  await run(`ALTER TABLE messages ADD COLUMN file_data TEXT`).catch(() => {});
 
-  // 4. Create Settings Table
+  // 4. Create Shelf Table
+  await run(`
+    CREATE TABLE IF NOT EXISTS shelf_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      item_type TEXT NOT NULL,
+      data TEXT NOT NULL,
+      size INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  // 5. Create Settings Table
   await run(`
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
@@ -107,7 +128,7 @@ export async function initDatabase() {
   await run("INSERT OR IGNORE INTO settings (key, value) VALUES ('gemini_model', 'gemini-2.0-flash')");
   await run("INSERT OR IGNORE INTO settings (key, value) VALUES ('claude_model', 'claude-3-5-sonnet-latest')");
 
-  // 5. Seed admin from env vars
+  // 6. Seed admin from env vars
   const adminEmail = process.env.ADMIN_EMAIL;
   const adminPassword = process.env.ADMIN_PASSWORD;
 
